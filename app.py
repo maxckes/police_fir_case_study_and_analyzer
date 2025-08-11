@@ -6,14 +6,12 @@ import os
 import json
 from dotenv import load_dotenv
 
-# --- PAGE CONFIGURATION & INITIALIZATION ---
 st.set_page_config(
     page_title="Police FIR Analysis Assistant",
     page_icon="⚖️",
     layout="wide"
 )
 
-# Basic production styling for better readability and structure
 _APP_STYLE = """
 <style>
 :root {
@@ -71,7 +69,7 @@ except AttributeError as e:
     st.error("🚨 Google API Key not found. Please set it in your .env file.", icon="🚨")
     st.stop()
 
-# --- MODEL AND DATABASE SETUP ---
+# --- MODEL AND DATABASE SETUP --
 LLM_MODEL_NAME = "gemini-2.5-flash"
 EMBEDDING_MODEL_NAME = "models/text-embedding-004"
 CHROMA_PATH = "fir_vector_db"
