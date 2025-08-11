@@ -2,7 +2,6 @@
 import streamlit as st
 import google.generativeai as genai
 import chromadb
-import PyPDF2
 import os
 import json
 from dotenv import load_dotenv
@@ -104,28 +103,9 @@ if "jurisdiction" not in st.session_state:
     st.session_state.jurisdiction = "Telangana"
 if "top_k_laws" not in st.session_state:
     st.session_state.top_k_laws = 5
-if "show_json" not in st.session_state:
-    st.session_state.show_json = False
-if "last_uploaded_name" not in st.session_state:
-    st.session_state.last_uploaded_name = None
+
 
 # --- FUNCTION DEFINITIONS ---
-
-def extract_text_from_upload(uploaded_file):
-    """Extracts text from uploaded PDF or TXT file."""
-    if uploaded_file.name.endswith('.pdf'):
-        try:
-            pdf_reader = PyPDF2.PdfReader(uploaded_file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text()
-            return text
-        except Exception as e:
-            st.error(f"Error reading PDF: {e}")
-            return None
-    elif uploaded_file.name.endswith('.txt'):
-        return uploaded_file.read().decode('utf-8')
-    return None
 
 def chunk_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 200):
     """
@@ -152,6 +132,28 @@ def _embed_query_text(text: str):
     except Exception as e:
         st.error(f"Failed to embed query text: {e}")
         return None
+
+@st.cache_data(show_spinner=False)
+def translate_to_te(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        model = genai.GenerativeModel(
+            LLM_MODEL_NAME,
+            generation_config={
+                "response_mime_type": "text/plain",
+                "temperature": 0.0,
+                "max_output_tokens": 2048,
+            }
+        )
+        resp = model.generate_content(
+            f"Translate to Telugu. Preserve legal meaning, names, and formatting. "
+            f"Only output the translation without any extra commentary:\n\n{text}"
+        )
+        return (getattr(resp, "text", "") or "").strip()
+    except Exception:
+        return text
 
 @st.cache_data(show_spinner=False)
 def retrieve_law_sections(query_text, k=5):
@@ -182,15 +184,14 @@ def build_system_prompt(fir_summary, relevant_laws, jurisdiction):
                 "rationale_en": "2-3 sentence rationale in English.",
                 "rationale_te": "2-3 sentence rationale in Telugu.",
                 "reasoning_quote_en": "Verbatim quote from the provided law text supporting the recommendation.",
-                "reasoning_quote_te": "తెలుగు లో చట్ట పాఠ్యంలోని సంబంధిత వాక్యాన్ని యథాతథంగా ఇవ్వండి. తెలుగు లేకపోతే ఆంగ్ల కోట్ ని ఇక్కడే కాపీ చేయండి.",
+                "reasoning_quote_te": "చట్ట పాఠ్యంలోని సంబంధిత వాక్యాన్ని తెలుగు లో యథాతధంగా ఇవ్వండి; తెలుగు లేనప్పుడు ఆంగ్ల వాక్యానికి నమ్మకమైన తెలుగు అనువాదాన్ని ఇవ్వండి.",
                 "fir_quote_en": "Verbatim excerpt from the FIR summary that supports this recommendation.",
-                "fir_quote_te": "FIR సారాంశం నుండి సరైన వాక్యాన్ని యథాతథంగా ఇవ్వండి. తెలుగు లేకపోతే ఆంగ్ల కోట్ ని ఇక్కడే కాపీ చేయండి.",
-                "confidence": 0.0,
+                "fir_quote_te": "కేసు వివరాల్లోని సంబంధిత వాక్యాన్ని తెలుగు లో యథాతధంగా ఇవ్వండి; అది తెలుగు లో లేకపోతే నమ్మకమైన తెలుగు అనువాదాన్ని ఇవ్వండి.",
                 "law_citation": {
                     "title_en": "Official name of the section in English",
-                    "title_te": "Official name of the section in Telugu",
+                    "title_te": "తెలుగు శీర్షిక; అందుబాటులో లేకపోతే ఆంగ్ల శీర్షికను నమ్మకంగా తెలుగు లోకి అనువదించండి.",
                     "full_text_en": "Complete official text in English (or best available English summary).",
-                    "full_text_te": "Complete official text in Telugu (or best available Telugu translation).",
+                    "full_text_te": "తెలుగు పూర్తి పాఠ్యం; అందుబాటులో లేకపోతే ఆంగ్ల పాఠ్యానికి నమ్మకమైన తెలుగు అనువాదాన్ని ఇవ్వండి.",
                     "url": "Official India Code URL (if available)."
                 }
             }
@@ -202,12 +203,11 @@ def build_system_prompt(fir_summary, relevant_laws, jurisdiction):
         "actions_te": [
             "Step 1 in Telugu",
             "Step 2 in Telugu"
-        ],
-        "confidence_score": "Overall confidence from 0.0 to 1.0"
+        ]
     }
 
     prompt = f"""
-    You are an expert AI legal assistant for Indian Police officers. Your task is to analyze a First Information Report (FIR) and provide a structured, actionable analysis. Do not include any personal or sensitive data from the FIR in your output.
+    You are an expert AI legal assistant for Indian Police officers. Your task is to analyze case details (FIR, theft report, victim statement, etc.) and provide a structured, actionable analysis. Do not include any personal or sensitive data from the input.
 
     Clarity and Detail Requirements:
     - Provide clear, specific, and concise rationale while ensuring useful detail (avoid vagueness).
@@ -219,11 +219,10 @@ def build_system_prompt(fir_summary, relevant_laws, jurisdiction):
     2. Recommend the most applicable IPC/CrPC sections.
     3. Provide rationale (2–3 sentences) for each section in both English and Telugu.
     4. Include `reasoning_quote_en` and `reasoning_quote_te` as verbatim quotes from the provided law text.
-    5. Assign a per-section confidence score (0.0–1.0) and an overall confidence_score.
-    6. Suggest 3–5 concrete procedural steps (in English and Telugu).
-    7. Cite the full law text and titles in both languages when available.
-    8. If Telugu law text or Telugu quotes are unavailable in the provided context, copy the exact English quote into the Telugu fields (reasoning_quote_te, fir_quote_te). Do not use placeholders like “తెలుగు పాఠ్యం సందర్భంలో అందించబడలేదు.”
-    9. For each recommended section, include an exact FIR excerpt (fir_quote_en, fir_quote_te) copied verbatim from the FIR summary that motivated the recommendation.
+    5. Suggest 3–5 concrete procedural steps (in English and Telugu).
+    6. Cite the full law text and titles in both languages when available.
+    7. If Telugu law text or Telugu quotes are unavailable in the provided context, produce a faithful Telugu translation for the Telugu fields (reasoning_quote_te, fir_quote_te, title_te, full_text_te). Do not leave them blank or copy English.
+    8. For each recommended section, include an exact FIR excerpt (fir_quote_en, fir_quote_te) copied verbatim from the FIR summary that motivated the recommendation.
 
     Context from Vector Database:
 
@@ -232,7 +231,7 @@ def build_system_prompt(fir_summary, relevant_laws, jurisdiction):
 
     Jurisdiction for this case: {jurisdiction}
 
-    FIR Summary to Analyze:
+    Case Details to Analyze:
     ```
     {fir_summary}
     ```
@@ -273,49 +272,17 @@ def call_gemini(system_prompt):
 
 
 # --- STREAMLIT UI LAYOUT ---
-st.title("⚖️ Police FIR Case Analysis Assistant")
+st.title("⚖️ Police Case Analysis Assistant")
 st.warning(
     "**Disclaimer:** This tool provides AI-generated recommendations for internal police use only. "
-    "All outputs must be verified by a qualified officer. Do not include sensitive PII in the input.",
+    "All outputs must be verified by a qualified officer. Do not include sensitive PII in the input. "
+    "You can paste FIRs, theft reports, victim statements, or other case details.",
     icon="⚠️"
 )
+st.info("Paste FIRs, theft reports, victim statements, or any case details into the chat below to analyze.")
 
-# --- SETTINGS (Sidebar) ---
-with st.sidebar:
-    st.header("Settings")
-    st.session_state.jurisdiction = st.selectbox(
-        "Select Jurisdiction:",
-        ("Telangana", "Andhra Pradesh", "Other"),
-        index=("Telangana", "Andhra Pradesh", "Other").index(st.session_state.jurisdiction)
-        if st.session_state.jurisdiction in ("Telangana", "Andhra Pradesh", "Other") else 0,
-    )
-    st.session_state.top_k_laws = st.slider("Top-K Laws to retrieve:", 1, 10, st.session_state.top_k_laws)
-    st.session_state.show_json = st.toggle("Show Raw LLM Output", value=st.session_state.show_json)
-
-    uploaded_file = st.file_uploader("Upload FIR (.pdf, .txt)", type=["pdf", "txt"])
-    if uploaded_file and uploaded_file.name != st.session_state.last_uploaded_name:
-        with st.spinner("Extracting text from file and analyzing..."):
-            extracted = extract_text_from_upload(uploaded_file)
-            if extracted:
-                st.session_state.fir_text = extracted
-                st.session_state.messages.append({"role": "user", "content": extracted})
-                # Run analysis immediately for uploaded file
-                relevant_laws = retrieve_law_sections(extracted, k=st.session_state.top_k_laws)
-                system_prompt = build_system_prompt(extracted, relevant_laws, st.session_state.jurisdiction)
-                analysis_result = call_gemini(system_prompt)
-                st.session_state.messages.append({"role": "assistant", "analysis_result": analysis_result or {}})
-                st.session_state.last_uploaded_name = uploaded_file.name
 
 # --- CHAT-LIKE MAIN CONTENT ---
-def _confidence_badge(confidence_value: float) -> str:
-    pct = max(0.0, min(1.0, confidence_value or 0.0))
-    color_class = (
-        "badge-green" if pct >= 0.75 else
-        "badge-amber" if pct >= 0.45 else
-        "badge-red"
-    )
-    return f"<span class='badge {color_class}'>{pct*100:.1f}%</span>"
-
 def _fallback_te(te_val: str, en_val: str) -> str:
     bads = {
         "", None,
@@ -324,9 +291,10 @@ def _fallback_te(te_val: str, en_val: str) -> str:
         "N/A"
     }
     te = (te_val or "").strip()
-    if not te or te in bads:
-        return (en_val or "").strip()
-    return te
+    if te and te not in bads:
+        return te
+    en = (en_val or "").strip()
+    return translate_to_te(en) if en else ""
 
 def _render_analysis_result(res: dict):
     if not res:
@@ -338,10 +306,9 @@ def _render_analysis_result(res: dict):
             section_label = sec.get("section", "N/A")
             law = sec.get("law_citation", {}) or {}
             title_en = law.get("title_en", "N/A")
-            title_te = law.get("title_te", "N/A")
-            conf_html = _confidence_badge(sec.get("confidence", 0))
+            title_te = _fallback_te(law.get("title_te"), title_en)
 
-            st.markdown(f"<div class='card'><strong>Section:</strong> <code>{section_label}</code> {conf_html}", unsafe_allow_html=True)
+            st.markdown(f"<div class='card'><strong>Section:</strong> <code>{section_label}</code>", unsafe_allow_html=True)
 
             col_en, col_te = st.columns(2)
             with col_en:
@@ -354,8 +321,9 @@ def _render_analysis_result(res: dict):
                     st.markdown(f"<div class='quote-block'>{quote_en}</div>", unsafe_allow_html=True)
             with col_te:
                 st.markdown("**తెలుగు**")
-                st.markdown(f"- శీర్షిక: {title_te}")
-                st.info(f"తర్కం: {sec.get('rationale_te', 'N/A')}")
+                st.markdown(f"- శీర్షిక: {title_te or 'N/A'}")
+                rationale_te = _fallback_te(sec.get('rationale_te'), sec.get('rationale_en'))
+                st.info(f"తర్కం: {rationale_te or 'N/A'}")
                 quote_te_raw = (sec.get("reasoning_quote_te") or "").strip()
                 quote_te = _fallback_te(quote_te_raw, quote_en)
                 if quote_te:
@@ -364,16 +332,15 @@ def _render_analysis_result(res: dict):
 
             with st.expander("View full law text and source"):
                 full_en = law.get("full_text_en") or law.get("full_text") or ""
-                full_te = law.get("full_text_te") or ""
-                url = law.get("url") or ""
+                full_te = _fallback_te(law.get("full_text_te"), full_en)
                 if full_en:
                     st.markdown("**Full text (English)**")
                     st.code(full_en, language="text")
                 if full_te:
                     st.markdown("**పూర్తి పాఠ్యం (తెలుగు)**")
                     st.code(full_te, language="text")
-                if url:
-                    st.caption(f"Source: {url}")
+                if law.get("url"):
+                    st.caption(f"Source: {law.get('url')}")
 
             fir_en = (sec.get("fir_quote_en") or "").strip()
             fir_te = _fallback_te((sec.get("fir_quote_te") or "").strip(), fir_en)
@@ -403,7 +370,11 @@ def _render_analysis_result(res: dict):
             st.markdown(f"{i}. {action}")
     with col_te_a:
         st.markdown("**తెలుగు**")
-        for i, action in enumerate(res.get("actions_te", []), 1):
+        actions_en = res.get("actions_en", [])
+        actions_te = res.get("actions_te", [])
+        if not actions_te and actions_en:
+            actions_te = [translate_to_te(a) for a in actions_en]
+        for i, action in enumerate(actions_te, 1):
             st.markdown(f"{i}. {action}")
 
 
@@ -415,7 +386,7 @@ for msg in st.session_state.messages:
         with st.chat_message("assistant"):
             _render_analysis_result(msg.get("analysis_result", {}))
 
-user_input = st.chat_input("Enter FIR text to analyze…")
+user_input = st.chat_input("Enter case details to analyze…")
 if user_input:
     st.session_state.fir_text = user_input
     with st.chat_message("user"):
@@ -431,17 +402,3 @@ if user_input:
         _render_analysis_result(analysis_result or {})
 
     st.session_state.messages.append({"role": "assistant", "analysis_result": analysis_result or {}})
-
-if st.session_state.show_json and st.session_state.messages:
-    last_assistant = next((m for m in reversed(st.session_state.messages) if m.get("role") == "assistant"), None)
-    if last_assistant:
-        st.markdown("---")
-        st.subheader("🤖 Raw LLM JSON Output")
-        latest = last_assistant.get("analysis_result", {})
-        st.json(latest)
-        st.download_button(
-            label="Download analysis JSON",
-            data=json.dumps(latest, ensure_ascii=False, indent=2),
-            file_name="fir_analysis.json",
-            mime="application/json",
-        )
